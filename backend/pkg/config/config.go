@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +34,9 @@ const (
 	DefaultMeEmailPath    = "email"
 	DefaultMeGroupsPath   = "groups,realm_access.roles"
 	DefaultMeUserInfoURL  = ""
+
+	DefaultOidcStsSubjectTokenType   = "urn:ietf:params:oauth:token-type:id_token"     // #nosec G101 -- token type URN.
+	DefaultOidcStsRequestedTokenType = "urn:ietf:params:oauth:token-type:access_token" // #nosec G101 -- token type URN.
 )
 
 type Config struct {
@@ -100,6 +104,14 @@ type Config struct {
 	UnsafeUseServiceAccountToken bool   `koanf:"unsafe-use-service-account-token"`
 	ServiceAccountTokenPath      string `koanf:"service-account-token-path"`
 	OidcAutoLogin                bool   `koanf:"oidc-auto-login"`
+	OidcStsTokenURL              string `koanf:"oidc-sts-token-url"`
+	OidcStsAudience              string `koanf:"oidc-sts-audience"`
+	OidcStsScopes                string `koanf:"oidc-sts-scopes"`
+	OidcStsSubjectTokenType      string `koanf:"oidc-sts-subject-token-type"`
+	OidcStsRequestedTokenType    string `koanf:"oidc-sts-requested-token-type"`
+	OidcStsExtraParams           string `koanf:"oidc-sts-extra-params"`
+	OidcStsClientID              string `koanf:"oidc-sts-client-id"`
+	OidcStsClientSecret          string `koanf:"oidc-sts-client-secret"`
 	// telemetry configs
 	ServiceName        string   `koanf:"service-name"`
 	ServiceVersion     *string  `koanf:"service-version"`
@@ -189,7 +201,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	return nil
+	return c.validateOIDCSTS()
 }
 
 // validateAppName ensures the application name is safe for use in Kubernetes User-Agent headers.
@@ -220,6 +232,69 @@ func (c *Config) validateOIDCCAFile() error {
 	}
 
 	return nil
+}
+
+// stsReservedParams are set by the token exchange itself and can't be
+// overridden with --oidc-sts-extra-params.
+var stsReservedParams = []string{
+	"grant_type", "subject_token", "subject_token_type", "requested_token_type",
+	"audience", "scope", "client_id", "client_secret",
+}
+
+// ParseOidcStsExtraParams parses the --oidc-sts-extra-params value.
+func ParseOidcStsExtraParams(params string) (url.Values, error) {
+	values, err := url.ParseQuery(params)
+	if err != nil {
+		return nil, fmt.Errorf("invalid oidc-sts-extra-params: %w", err)
+	}
+
+	for _, name := range stsReservedParams {
+		if values.Has(name) {
+			return nil, fmt.Errorf("oidc-sts-extra-params cannot set %q, it has its own flag or is set by Headlamp", name)
+		}
+	}
+
+	return values, nil
+}
+
+func (c *Config) validateOIDCSTS() error {
+	if c.OidcStsTokenURL == "" {
+		if c.OidcStsAudience != "" || c.OidcStsScopes != "" || c.OidcStsExtraParams != "" ||
+			c.OidcStsClientID != "" || c.OidcStsClientSecret != "" {
+			return errors.New("oidc-sts-* flags require oidc-sts-token-url")
+		}
+
+		return nil
+	}
+
+	if !c.InCluster || c.OidcIdpIssuerURL == "" {
+		return errors.New("oidc-sts-token-url requires --in-cluster and OIDC (oidc-idp-issuer-url)")
+	}
+
+	if c.ProxyAuthEnabled || c.UnsafeUseServiceAccountToken {
+		return errors.New("oidc-sts-token-url cannot be used with proxy-auth or unsafe-use-service-account-token")
+	}
+
+	tokenURL, err := url.Parse(c.OidcStsTokenURL)
+	if err != nil || tokenURL.Scheme != "https" || tokenURL.Host == "" {
+		return errors.New("oidc-sts-token-url must be an https URL")
+	}
+
+	if c.OidcStsAudience == "" {
+		return errors.New("oidc-sts-audience is required with oidc-sts-token-url")
+	}
+
+	if c.OidcStsSubjectTokenType == "" || c.OidcStsRequestedTokenType == "" {
+		return errors.New("oidc-sts-subject-token-type and oidc-sts-requested-token-type cannot be empty")
+	}
+
+	if c.OidcStsClientSecret != "" && c.OidcStsClientID == "" {
+		return errors.New("oidc-sts-client-secret requires oidc-sts-client-id")
+	}
+
+	_, err = ParseOidcStsExtraParams(c.OidcStsExtraParams)
+
+	return err
 }
 
 func (c *Config) validateClusterInventory() error {
@@ -586,6 +661,7 @@ func flagset(appName string) *flag.FlagSet {
 
 	addGeneralFlags(f, appName)
 	addOIDCFlags(f)
+	addOIDCSTSFlags(f)
 	addProxyAuthFlags(f)
 	addTelemetryFlags(f)
 	addTLSFlags(f)
@@ -684,6 +760,24 @@ func addOIDCFlags(f *flag.FlagSet) {
 		"Comma separated JMESPath expressions used to read groups from the JWT payload")
 	f.String("me-user-info-url", DefaultMeUserInfoURL,
 		"URL to fetch additional user info for the /me endpoint. For oauth2proxy /oauth2/userinfo can be used.")
+}
+
+func addOIDCSTSFlags(f *flag.FlagSet) {
+	f.String("oidc-sts-token-url", "",
+		"Token endpoint of an RFC 8693 security token service. When set, the OIDC token of the in-cluster "+
+			"context is exchanged there before it is sent to the Kubernetes API server")
+	f.String("oidc-sts-audience", "", "Audience to request from the security token service")
+	f.String("oidc-sts-scopes", "", "A comma separated list of scopes to request from the security token service")
+	f.String("oidc-sts-subject-token-type", DefaultOidcStsSubjectTokenType,
+		"Token type of the OIDC token sent to the security token service")
+	f.String("oidc-sts-requested-token-type", DefaultOidcStsRequestedTokenType,
+		"Token type to request from the security token service")
+	f.String("oidc-sts-extra-params", "",
+		"Extra form parameters for the security token service, in URL query format "+
+			`(for example options={"userProject":"123"})`)
+	f.String("oidc-sts-client-id", "",
+		"Client ID to authenticate to the security token service with. No client authentication is sent if empty")
+	f.String("oidc-sts-client-secret", "", "Client secret to authenticate to the security token service with")
 }
 
 func addProxyAuthFlags(f *flag.FlagSet) {

@@ -1262,3 +1262,126 @@ func TestGetDefaultKubeConfigPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, filepath.Join(tmpDir, ".kube", "config"), path)
 }
+
+func TestOIDCSTSFlags(t *testing.T) {
+	t.Setenv("HEADLAMP_CONFIG_OIDC_STS_CLIENT_SECRET", "from-env")
+
+	conf, err := config.Parse([]string{
+		"go run ./cmd",
+		"--in-cluster",
+		"--oidc-idp-issuer-url=https://login.microsoftonline.com/tenant/v2.0",
+		"--oidc-sts-token-url=https://sts.googleapis.com/v1/token",
+		"--oidc-sts-audience=//iam.googleapis.com/locations/global/workforcePools/pool/providers/entra",
+		"--oidc-sts-scopes=https://www.googleapis.com/auth/cloud-platform",
+		`--oidc-sts-extra-params=options={"userProject":"123"}`,
+		"--oidc-sts-client-id=sts-client",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, "https://sts.googleapis.com/v1/token", conf.OidcStsTokenURL)
+	assert.Equal(t, "//iam.googleapis.com/locations/global/workforcePools/pool/providers/entra", conf.OidcStsAudience)
+	assert.Equal(t, "https://www.googleapis.com/auth/cloud-platform", conf.OidcStsScopes)
+	assert.Equal(t, config.DefaultOidcStsSubjectTokenType, conf.OidcStsSubjectTokenType)
+	assert.Equal(t, config.DefaultOidcStsRequestedTokenType, conf.OidcStsRequestedTokenType)
+	assert.Equal(t, "sts-client", conf.OidcStsClientID)
+	assert.Equal(t, "from-env", conf.OidcStsClientSecret)
+
+	params, err := config.ParseOidcStsExtraParams(conf.OidcStsExtraParams)
+	require.NoError(t, err)
+	assert.Equal(t, `{"userProject":"123"}`, params.Get("options"))
+}
+
+func TestOIDCSTSValidation(t *testing.T) { //nolint:funlen // table of validation cases.
+	valid := []string{
+		"go run ./cmd",
+		"--in-cluster",
+		"--oidc-idp-issuer-url=https://login.microsoftonline.com/tenant/v2.0",
+		"--oidc-sts-token-url=https://sts.googleapis.com/v1/token",
+		"--oidc-sts-audience=//iam.googleapis.com/locations/global/workforcePools/pool/providers/entra",
+	}
+
+	tests := []struct {
+		name          string
+		args          []string
+		errorContains string
+	}{
+		{name: "valid", args: valid},
+		{
+			name:          "settings_without_token_url",
+			args:          []string{"go run ./cmd", "--oidc-sts-audience=aud"},
+			errorContains: "require oidc-sts-token-url",
+		},
+		{
+			name: "not_in_cluster",
+			args: []string{
+				"go run ./cmd", "--oidc-use-cookie", "--oidc-idp-issuer-url=https://idp.example.com",
+				"--oidc-sts-token-url=https://sts.example.com/token", "--oidc-sts-audience=aud",
+			},
+			errorContains: "requires --in-cluster and OIDC",
+		},
+		{
+			name: "without_oidc",
+			args: []string{
+				"go run ./cmd", "--in-cluster",
+				"--oidc-sts-token-url=https://sts.example.com/token", "--oidc-sts-audience=aud",
+			},
+			errorContains: "requires --in-cluster and OIDC",
+		},
+		{
+			name:          "http_token_url",
+			args:          append(append([]string{}, valid...), "--oidc-sts-token-url=http://sts.example.com/token"),
+			errorContains: "must be an https URL",
+		},
+		{
+			name:          "without_audience",
+			args:          append(append([]string{}, valid...), "--oidc-sts-audience="),
+			errorContains: "oidc-sts-audience is required",
+		},
+		{
+			name:          "empty_subject_token_type",
+			args:          append(append([]string{}, valid...), "--oidc-sts-subject-token-type="),
+			errorContains: "cannot be empty",
+		},
+		{
+			name:          "secret_without_client_id",
+			args:          append(append([]string{}, valid...), "--oidc-sts-client-secret=secret"),
+			errorContains: "requires oidc-sts-client-id",
+		},
+		{
+			name:          "with_proxy_auth",
+			args:          append(append([]string{}, valid...), "--proxy-auth"),
+			errorContains: "cannot be used with proxy-auth",
+		},
+		{
+			name:          "with_service_account_token",
+			args:          append(append([]string{}, valid...), "--unsafe-use-service-account-token"),
+			errorContains: "cannot be used with proxy-auth or unsafe-use-service-account-token",
+		},
+		{
+			name:          "extra_params_override_reserved",
+			args:          append(append([]string{}, valid...), "--oidc-sts-extra-params=audience=other"),
+			errorContains: `cannot set "audience"`,
+		},
+		{
+			name:          "invalid_extra_params",
+			args:          append(append([]string{}, valid...), "--oidc-sts-extra-params=options=%zz"),
+			errorContains: "invalid oidc-sts-extra-params",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf, err := config.Parse(tt.args)
+			if tt.errorContains == "" {
+				require.NoError(t, err)
+				require.NotNil(t, conf)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Nil(t, conf)
+			assert.Contains(t, err.Error(), tt.errorContains)
+		})
+	}
+}
