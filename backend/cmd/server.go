@@ -246,6 +246,7 @@ func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 	return &HeadlampConfig{
 		HeadlampConfig:    cfg,
 		compiledProxyURLs: compiledProxyURLs,
+		stsExchanger:      newSTSExchanger(conf),
 	}
 }
 
