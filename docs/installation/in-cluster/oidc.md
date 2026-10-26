@@ -152,6 +152,33 @@ When a single Headlamp instance serves several Kubernetes clusters that all trus
 - Each target cluster receives one or more `Set-Cookie` headers per login, so enabling this with very large multi-cluster kubeconfigs may approach browser and proxy cookie count / size limits.
 - Pre-existing chunk-cookie limitation: stale chunk cookies on cluster paths are not actively cleared during login because cookies live under `/clusters/<cluster>` while OIDC login completes on `/oidc-callback`. In the rare case a re-issued token uses fewer chunks than the previous one, the affected cluster(s) may need a one-time re-login.
 
+### Exchange the OIDC token at a security token service (STS)
+
+Some API servers don't trust the identity provider users sign in with, but do trust a security token service that exchanges its tokens ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)). For example, GKE with [Workforce Identity Federation](https://cloud.google.com/iam/docs/workforce-identity-federation) accepts Google access tokens that Google STS issues in exchange for Microsoft Entra ID tokens.
+
+When an STS token URL is set, Headlamp exchanges the user's OIDC token for every request to the in-cluster context and sends the exchanged token to the API server. The browser cookie keeps the OIDC token, and exchanged tokens are cached in memory until shortly before they, or the OIDC token they came from, expire.
+
+- `-oidc-sts-token-url` or env var `HEADLAMP_CONFIG_OIDC_STS_TOKEN_URL`: the STS token endpoint. It must be `https`.
+- `-oidc-sts-audience` or env var `HEADLAMP_CONFIG_OIDC_STS_AUDIENCE`: the audience to request (required).
+- `-oidc-sts-scopes` or env var `HEADLAMP_CONFIG_OIDC_STS_SCOPES`: a comma separated list of scopes to request.
+- `-oidc-sts-subject-token-type` or env var `HEADLAMP_CONFIG_OIDC_STS_SUBJECT_TOKEN_TYPE`: defaults to `urn:ietf:params:oauth:token-type:id_token`.
+- `-oidc-sts-requested-token-type` or env var `HEADLAMP_CONFIG_OIDC_STS_REQUESTED_TOKEN_TYPE`: defaults to `urn:ietf:params:oauth:token-type:access_token`.
+- `-oidc-sts-extra-params` or env var `HEADLAMP_CONFIG_OIDC_STS_EXTRA_PARAMS`: extra form parameters some services need, in URL query format, e.g. `options={"userProject":"123456789"}`.
+- `-oidc-sts-client-id` and `-oidc-sts-client-secret` (env vars `HEADLAMP_CONFIG_OIDC_STS_CLIENT_ID` and `HEADLAMP_CONFIG_OIDC_STS_CLIENT_SECRET`): only if the STS requires client authentication. Headlamp never sends its OIDC client credentials to the STS.
+
+Headlamp responds with `401` when the STS rejects the token, so the user is asked to sign in again, and with `502` when the STS can't be reached. Token exchange only works in-cluster, and can't be combined with `-proxy-auth` or `-unsafe-use-service-account-token`. It doesn't cover frontends built with the WebSocket multiplexer (`REACT_APP_ENABLE_WEBSOCKET_MULTIPLEXER=true`).
+
+For example, for Microsoft Entra ID and Google Workforce Identity Federation, configure the workforce pool provider with Headlamp's Entra client ID, so it accepts the Entra ID token, then set:
+
+- `-oidc-client-id`, `-oidc-client-secret` and `-oidc-idp-issuer-url` for Entra ID as usual, without `-oidc-use-access-token`, so Headlamp keeps the ID token
+- `-oidc-scopes=profile,email,offline_access` so Headlamp gets a refresh token
+- `-oidc-sts-token-url=https://sts.googleapis.com/v1/token`
+- `-oidc-sts-audience=//iam.googleapis.com/locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID`
+- `-oidc-sts-scopes=https://www.googleapis.com/auth/cloud-platform`
+- `-oidc-sts-extra-params=options={"userProject":"PROJECT_NUMBER"}`
+
+Users are then known to the cluster as `principal://iam.googleapis.com/locations/global/workforcePools/POOL_ID/subject/SUBJECT`, which RBAC bindings can refer to.
+
 ### Example: OIDC with Keycloak in Minikube
 
 If you are interested in a comprehensive example of using OIDC and Headlamp,
