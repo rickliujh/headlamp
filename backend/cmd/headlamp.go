@@ -91,6 +91,8 @@ type HeadlampConfig struct {
 	proxyURLMu        sync.Mutex
 	compiledProxyURLs []glob.Glob
 	oidcStateReader   io.Reader
+	// stsExchanger exchanges OIDC tokens for the in-cluster context; nil if off.
+	stsExchanger *auth.STSExchanger
 }
 
 func compileProxyURLPatterns(patterns []string) ([]glob.Glob, error) {
@@ -1715,6 +1717,12 @@ func (c *HeadlampConfig) requestTokenForContext(
 		return ""
 	}
 
+	// Routes outside /clusters/<cluster>/ aren't covered by stsTokenMiddleware,
+	// and their token must not reach the API server unexchanged.
+	if c.usesSTS(kContext) && !stsExchanged(r) {
+		return ""
+	}
+
 	token := auth.BearerTokenValue(r.Header.Get("Authorization"))
 	if token == "" {
 		token = tokenFromCookie(r, clusterName)
@@ -1885,6 +1893,8 @@ func serverHandler(ctx context.Context, config *HeadlampConfig) (http.Handler, e
 		return nil, err
 	}
 
+	// Runs inside the refresh middleware so it exchanges the refreshed token.
+	handler = config.stsTokenMiddleware(handler)
 	handler = config.OIDCTokenRefreshMiddleware(handler)
 
 	// Only validate the Host header when listening on a loopback address.
